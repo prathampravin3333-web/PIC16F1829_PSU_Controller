@@ -42,9 +42,11 @@
 #define CONST_187K      RC6    // PIN 8 - 187kHz constant frequency
 #define LED_CLIP        RC7    // PIN 9 - Clipping indicator LED
 #define LED_PROT        RB7    // PIN 12- Protection LED
-#define RAIL_95V        RC2    // PIN 6 - 95V rail sensing (AN6)
 #define BATT_12V        RC1    // PIN 25- 12V battery sensing (AN5)
 #define AUDIO_SENSE     RA1    // PIN 18- External audio 5V sense (AN1)
+
+// NOTE: PIN 6 (RC2) has NO OUTPUT - Used only for 95V rail sensing input (AN6)
+// RC2 is configured as analog input only, no digital output capability
 
 // Temperature Thresholds (ADC values for 10K NTC)
 #define TEMP_UNDER_50C   768    // ADC threshold for under 50°C (low speed)
@@ -56,7 +58,7 @@
 #define BATT_UVP_10_5V   205    // Under-voltage protection (10.5V)
 #define BATT_OVP_14_8V   288    // Over-voltage protection (14.8V)
 
-// 95V Rail: Resistor divider for ADC sensing
+// 95V Rail: Resistor divider for ADC sensing (INPUT ONLY)
 #define RAIL_95V_TARGET  732    // 95V target (ADC value)
 #define RAIL_95V_MIN     710    // 92.5V minimum
 #define RAIL_95V_MAX     754    // 97.5V maximum
@@ -67,6 +69,9 @@
 #define PWM_MIN_DUTY    5      // Minimum duty cycle (5% - prevent DC offset)
 #define PWM_MAX_DUTY    250    // Maximum duty cycle (98% - leave headroom)
 #define DEAD_TIME       8      // Dead time between HIGH and LOW transition
+
+// 187kHz Timer Parameters
+#define TIMER1_RELOAD   0xFE0D // Timer1 reload for 187kHz @ 8MHz
 
 // Global Variables
 uint16_t adc_temp = 0;
@@ -79,6 +84,7 @@ uint16_t timer_ms = 0;
 uint8_t fault_latch = 0;
 uint8_t system_state = 0;
 int16_t voltage_error_accum = 0;
+uint8_t toggle_187k = 0;       // Toggle flag for 187kHz output
 
 #define STATE_OFF           0
 #define STATE_SOFT_START    1
@@ -90,7 +96,7 @@ void Init_Oscillator(void);
 void Init_IO(void);
 void Init_ADC(void);
 void Init_PWM_PushPull(void);
-void Init_187K_Output(void);
+void Init_187K_Timer(void);
 void Init_Timer(void);
 void Read_Sensors(void);
 void Fan_Speed_Control(void);
@@ -98,6 +104,7 @@ void PWM_Soft_Start(void);
 void Voltage_Regulation(void);
 void LED_Control(void);
 void Set_PWM_Duty(uint8_t duty);
+void Toggle_187K_Output(void);
 void __interrupt() ISR(void);
 
 /*
@@ -109,7 +116,7 @@ void main(void)
     Init_IO();
     Init_ADC();
     Init_PWM_PushPull();
-    Init_187K_Output();
+    Init_187K_Timer();
     Init_Timer();
     
     __delay_ms(100);
@@ -168,6 +175,7 @@ void Init_Oscillator(void)
 
 /*
  * I/O Initialization
+ * PIN 6 (RC2) is ANALOG INPUT ONLY - NO DIGITAL OUTPUT
  */
 void Init_IO(void)
 {
@@ -177,13 +185,14 @@ void Init_IO(void)
     // TRISB: RB7(input-protection), others output
     TRISB = 0b10000000;
     
-    // TRISC: RC1(input/AN5), RC2(input/AN6), RC3-7(output/PWM)
+    // TRISC: RC1(input/AN5), RC2(input/AN6-NO OUTPUT), RC3-7(output/PWM)
+    // RC2 is configured as analog input only
     TRISC = 0b00000110;
     
-    // Analog inputs
+    // Analog inputs configuration
     ANSELA = 0b00010010; // RA1, RA4 analog
     ANSELB = 0b00000000;
-    ANSELC = 0b00000110; // RC1, RC2 analog
+    ANSELC = 0b00000110; // RC1, RC2 analog (RC2 has NO digital output)
     
     // Initialize outputs to safe state
     PORTA = 0x00;
@@ -225,8 +234,6 @@ void Init_PWM_PushPull(void)
     
     // Timer2 configuration for 30kHz (PWM frequency)
     // Fosc = 8MHz, Prescale = 1:1, PR2 = 0x53
-    // PWM Period = (PR2 + 1) * 4 * Tcy = 84 * 4 * 0.125us = 4.2us (238kHz)
-    // Adjusted for 30kHz: PR2 = 0x53
     T2CON = 0b00000100;       // Timer2 ON, 1:1 prescaler
     PR2 = PWM_FREQ_30K;       // 30kHz base frequency
     TMR2 = 0;
@@ -238,26 +245,23 @@ void Init_PWM_PushPull(void)
 }
 
 /*
- * Initialize 187kHz Constant Output on RC6
- * Using CCP3 PWM mode with 50% duty cycle
+ * Initialize 187kHz Output on RC6 using Timer1
+ * RC6 toggled in interrupt for 187kHz @ 50% duty
  */
-void Init_187K_Output(void)
+void Init_187K_Timer(void)
 {
-    // CCP3 on RC6 - Constant 187kHz at 50% duty
-    CCP3CON = 0x0C;           // PWM mode
+    TRISC6 = 0;                // RC6 as output
+    PORTC6 = 0;               // Start LOW
     
-    // For 187kHz: PR2 calculation
-    // 187kHz requires different timer or PWM period
-    // Alternative: Use Timer1 or PWM with different prescaler
-    // Simplified: Set as constant output or use PWM with adjusted timing
+    // Timer1 Configuration for 187kHz toggle timing
+    // For 187kHz square wave: toggle every ~2.67us
+    // Timer1: 16-bit, 1:1 prescaler, internal clock
+    T1CON = 0b00000000;        // Timer1 OFF, 16-bit, 1:1 prescaler
+    TMR1H = (TIMER1_RELOAD >> 8);  // Reload value high byte
+    TMR1L = (TIMER1_RELOAD & 0xFF); // Reload value low byte
     
-    // Set RC6 as constant 187kHz output
-    // This can be implemented via software toggle or external oscillator
-    // For now, set as output
-    TRISC6 = 0;               // RC6 as output
-    
-    // TODO: Implement 187kHz timer/counter if hardware PWM not available
-    // Option: Use Timer1 + software toggle for 187kHz
+    T1IE = 1;                  // Enable Timer1 interrupt
+    GIE = 1;                   // Global interrupt enable
 }
 
 /*
@@ -266,7 +270,6 @@ void Init_187K_Output(void)
 void Init_Timer(void)
 {
     // Timer0: 8-bit, 1:64 prescaler
-    // Overflow every ~2ms @ 8MHz
     T0CON = 0b11000101;       // Timer0 ON, 8-bit, 1:64 prescaler
     TMR0 = 0;
     T0IE = 1;
@@ -284,7 +287,7 @@ void Read_Sensors(void)
     // Round-robin ADC reading
     switch(channel)
     {
-        case 0: // AN6 (RC2) - 95V Rail
+        case 0: // AN6 (RC2) - 95V Rail (ANALOG INPUT ONLY)
             ADCON0bits.CHS = 0b00110;
             break;
         case 1: // AN5 (RC1) - 12V Battery
@@ -308,7 +311,7 @@ void Read_Sensors(void)
     switch(channel)
     {
         case 0:
-            adc_rail = adc_result;  // 95V rail voltage
+            adc_rail = adc_result;  // 95V rail voltage (INPUT ONLY - NO OUTPUT)
             break;
         case 1:
             adc_batt = adc_result;  // 12V battery voltage
@@ -326,9 +329,6 @@ void Read_Sensors(void)
 
 /*
  * Fan Speed Control Based on Temperature (RA5 pin control)
- * Under 50°C: Low speed (30%)
- * 50-90°C: Linear ramp to full speed
- * >90°C: Fault latch
  */
 void Fan_Speed_Control(void)
 {
@@ -347,7 +347,7 @@ void Fan_Speed_Control(void)
             // Between 50°C and 90°C - linear ramp
             if(adc_temp > TEMP_LATCH_90C)
             {
-                fan_speed = 100;  // Full speed (clamp at upper limit)
+                fan_speed = 100;  // Full speed
             }
             else
             {
@@ -364,16 +364,15 @@ void Fan_Speed_Control(void)
     }
     
     // Map fan speed (0-100%) to PWM duty (50-250 for push-pull)
-    pwm_duty = 128 + (fan_speed * 122 / 100);  // 128 ± 122 = 6-250
+    pwm_duty = 128 + (fan_speed * 122 / 100);
 }
 
 /*
  * PWM Soft Start - 7 Second Ramp
- * Gradually increase duty cycle from center
  */
 void PWM_Soft_Start(void)
 {
-    uint16_t max_soft_start_ticks = (SOFT_START_TIME / 10);  // 700 ticks for 7 seconds @ 10ms
+    uint16_t max_soft_start_ticks = (SOFT_START_TIME / 10);
     
     if(soft_start_counter < max_soft_start_ticks)
     {
@@ -423,10 +422,6 @@ void Voltage_Regulation(void)
 
 /*
  * Set PWM Duty Cycle for Push-Pull Topology
- * duty: 0-255 (128 = 50% = center)
- * HIGH side = duty value
- * LOW side = complementary value (255 - duty)
- * Includes dead time
  */
 void Set_PWM_Duty(uint8_t duty)
 {
@@ -449,6 +444,14 @@ void Set_PWM_Duty(uint8_t duty)
 }
 
 /*
+ * Toggle 187kHz Output on RC6
+ */
+void Toggle_187K_Output(void)
+{
+    RC6 = !RC6;  // Toggle RC6 for 187kHz square wave
+}
+
+/*
  * LED Control and Status Indication
  */
 void LED_Control(void)
@@ -468,33 +471,58 @@ void LED_Control(void)
  */
 void __interrupt() ISR(void)
 {
+    // Timer0 interrupt - 1ms tick
     if(T0IE && T0IF)
     {
         T0IF = 0;
         timer_ms++;
     }
     
+    // Timer1 interrupt - 187kHz output toggle (RC6)
+    if(T1IE && T1IF)
+    {
+        T1IF = 0;
+        
+        // Reload Timer1 for next toggle
+        TMR1H = (TIMER1_RELOAD >> 8);
+        TMR1L = (TIMER1_RELOAD & 0xFF);
+        
+        // Toggle RC6 for 187kHz square wave @ 50% duty
+        Toggle_187K_Output();
+    }
+    
+    // ADC interrupt
     if(ADIE && ADIF)
     {
         ADIF = 0;
     }
     
+    // Timer2 interrupt - PWM timing
     if(T2IE && T2IF)
     {
         T2IF = 0;
-        // Timer2 interrupt for PWM timing (if needed)
     }
 }
 
 /*
  * End of File
  * 
+ * PIN CONFIGURATION SUMMARY:
+ * PIN 2 (RA5): FAN ON SIGNAL - Digital Output
+ * PIN 3 (RA4): NTC Temperature Sensor - Analog Input
+ * PIN 5 (RC5): 30kHz PWM High Side - Output
+ * PIN 6 (RC2): 95V Rail Sense - ANALOG INPUT ONLY (NO OUTPUT)
+ * PIN 7 (RC3): ON LED - Digital Output
+ * PIN 8 (RC6): 187kHz Constant - Digital Output
+ * PIN 9 (RC7): Clip LED - Digital Output
+ * PIN 12 (RB7): Protection LED - Digital Output
+ * PIN 14 (RC4): 30kHz PWM Low Side (Inverted) - Output
+ * PIN 18 (RA1): External Audio 5V Sense - Analog Input
+ * PIN 25 (RC1): 12V Battery Sense - Analog Input
+ * 
  * PUSH-PULL TOPOLOGY NOTES:
  * - RC5 and RC4 are complementary outputs (180° out of phase)
  * - Dead time inserted between transitions to prevent shoot-through
  * - PWM duty varies around 50% center point (128)
- * - Higher duty = MORE power through HIGH side transistor
- * - Lower duty = MORE power through LOW side transistor
- * - Soft start gradually changes duty from center point
- * - Voltage regulation adjusts duty to maintain 95V output
+ * - 187kHz on RC6 generated via Timer1 interrupt toggle
  */
